@@ -1195,9 +1195,10 @@ async function run() {
     console.log('Vite development middleware configured successfully.');
   } else {
     // Serve production build
-    app.use(express.static(path.join(__dirname, 'dist')));
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
     app.get('*', (req, res) => {
-      res.sendFile(path.join(__dirname, 'dist/index.html'));
+      res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
