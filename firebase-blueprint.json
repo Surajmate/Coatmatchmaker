@@ -1,0 +1,122 @@
+{
+  "entities": {
+    "Player": {
+      "title": "Player",
+      "description": "Information about a Spades player in a game seat",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "The unique user ID" },
+        "name": { "type": "string", "description": "Display name of the user" },
+        "isBot": { "type": "boolean", "description": "True if player is an automated robot" },
+        "seat": { "type": "integer", "description": "The seat index from 0 to 3" },
+        "isReady": { "type": "boolean", "description": "True if player is ready to start" }
+      },
+      "required": ["id", "name", "isBot", "seat", "isReady"]
+    },
+    "Card": {
+      "title": "Card",
+      "description": "A single card from a 6-Ace Spades deck",
+      "type": "object",
+      "properties": {
+        "suit": { "type": "string", "enum": ["S", "H", "D", "C"] },
+        "value": { "type": "string", "enum": ["6", "7", "8", "9", "10", "J", "Q", "K", "A"] },
+        "rank": { "type": "integer" }
+      },
+      "required": ["suit", "value", "rank"]
+    },
+    "TrickPlayed": {
+      "title": "TrickPlayed",
+      "description": "A card played in the active trick",
+      "type": "object",
+      "properties": {
+        "card": { "$ref": "#/definitions/Card" },
+        "playerIndex": { "type": "integer" }
+      },
+      "required": ["card", "playerIndex"]
+    },
+    "RoundHistoryItem": {
+      "title": "RoundHistoryItem",
+      "description": "Historical record of past rounds and score changes",
+      "type": "object",
+      "properties": {
+        "round": { "type": "integer" },
+        "bidder": { "type": "integer" },
+        "bid": { "type": "string" },
+        "team1Tricks": { "type": "integer" },
+        "team2Tricks": { "type": "integer" },
+        "team1ScoreChange": { "type": "integer" },
+        "team2ScoreChange": { "type": "integer" },
+        "accumulatedTeam1": { "type": "integer" },
+        "accumulatedTeam2": { "type": "integer" }
+      },
+      "required": ["round", "bidder", "bid", "team1Tricks", "team2Tricks", "team1ScoreChange", "team2ScoreChange", "accumulatedTeam1", "accumulatedTeam2"]
+    },
+    "Room": {
+      "title": "Room",
+      "description": "Public Spades game room and match state",
+      "type": "object",
+      "properties": {
+        "roomId": { "type": "string" },
+        "phase": { "type": "string", "enum": ["LOBBY", "BIDDING", "SELECTING_HUKOOM", "PLAYING", "ROUND_OVER", "GAME_OVER"] },
+        "players": { "type": "array", "description": "List of 4 seats containing Player details or nulls" },
+        "dealer": { "type": "integer" },
+        "currentBidder": { "type": "integer" },
+        "highestBid": { "type": "integer" },
+        "highestBidder": { "type": "integer" },
+        "bids": { "type": "array" },
+        "currentTurn": { "type": "integer" },
+        "tricks": { "type": "array" },
+        "leadingSuit": { "type": "string" },
+        "spadesBroken": { "type": "boolean" },
+        "hukoomSuit": { "type": "string" },
+        "hukoomBroken": { "type": "boolean" },
+        "team1TricksWon": { "type": "integer" },
+        "team2TricksWon": { "type": "integer" },
+        "scoreTeam1": { "type": "integer" },
+        "scoreTeam2": { "type": "integer" },
+        "winnerTeam": { "type": "integer" },
+        "history": { "type": "array" },
+        "lastTrickWinner": { "type": "integer" },
+        "hostId": { "type": "string", "description": "The playerId of the host" }
+      },
+      "required": ["roomId", "phase", "players", "dealer", "currentBidder", "scoreTeam1", "scoreTeam2"]
+    },
+    "PlayerHand": {
+      "title": "PlayerHand",
+      "description": "A player's private hand of dealt cards",
+      "type": "object",
+      "properties": {
+        "playerId": { "type": "string" },
+        "cards": { "type": "array", "description": "List of Card objects" }
+      },
+      "required": ["playerId", "cards"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A text message or emoji reaction sent by a user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "senderName": { "type": "string" },
+        "text": { "type": "string" },
+        "seat": { "type": "integer" },
+        "timestamp": { "type": "integer" }
+      },
+      "required": ["id", "senderName", "text", "seat", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": "Room",
+      "description": "The main game room containing matches and lobbies"
+    },
+    "/rooms/{roomId}/hands/{playerId}": {
+      "schema": "PlayerHand",
+      "description": "Private hands for each player to prevent client peeking"
+    },
+    "/rooms/{roomId}/messages/{messageId}": {
+      "schema": "ChatMessage",
+      "description": "Unbounded collection of chat messages for the room"
+    }
+  }
+}

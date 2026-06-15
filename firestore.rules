@@ -1,0 +1,103 @@
+rules_version = '2';
+service cloudfirestore {
+  match /databases/{database}/documents {
+
+    // Global default safety net: reject everything by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Secure room collections
+    match /rooms/{roomId} {
+      
+      // Helpers
+      function isSignedIn() {
+        return request.auth != null;
+      }
+
+      function isValidId(id) {
+        return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      }
+
+      function incoming() {
+        return request.resource.data;
+      }
+
+      function existing() {
+        return resource.data;
+      }
+
+      // Check if user is registered as an active player inside the room document
+      function isPlayerInRoom(roomObj) {
+        return roomObj.players != null && 
+               roomObj.players is list && (
+                 (roomObj.players.size() > 0 && roomObj.players[0] != null && roomObj.players[0].id == request.auth.uid) ||
+                 (roomObj.players.size() > 1 && roomObj.players[1] != null && roomObj.players[1].id == request.auth.uid) ||
+                 (roomObj.players.size() > 2 && roomObj.players[2] != null && roomObj.players[2].id == request.auth.uid) ||
+                 (roomObj.players.size() > 3 && roomObj.players[3] != null && roomObj.players[3].id == request.auth.uid)
+               );
+      }
+
+      // Read rules: Any authenticated user can read public state to join
+      allow get, list: if isSignedIn() && isValidId(roomId);
+
+      // Create rules: Users can start a public room if they register themselves as Creator or Player 0
+      allow create: if isSignedIn() && isValidId(roomId) && (
+        incoming().roomId == roomId &&
+        incoming().phase == 'LOBBY' &&
+        incoming().players != null &&
+        incoming().players is list &&
+        incoming().players.size() > 0 &&
+        incoming().players[0] != null &&
+        incoming().players[0].id == request.auth.uid
+      );
+
+      // Update rules: Only registered players in the room can make updates
+      allow update: if isSignedIn() && isValidId(roomId) && (
+        // Must be a registered player in the active match
+        (isPlayerInRoom(existing()) || isPlayerInRoom(incoming())) &&
+        
+        // Prevent editing high-priority read-only parameters outside of game flow
+        incoming().roomId == existing().roomId
+      );
+
+      // Delete rules: Deletion is forbidden to preserve durability
+      allow delete: if false;
+
+      // Sub-collection: Private playing cards hand for secure concealment
+      match /hands/{playerId} {
+        
+        function isOwner() {
+          return request.auth.uid == playerId;
+        }
+
+        // Each player can only read and write their own exact hand
+        allow read, write: if isSignedIn() && isOwner();
+      }
+
+      // Sub-collection: Chat logs
+      match /messages/{messageId} {
+        
+        function isOwnerOfMessage() {
+          return request.auth.uid != null && incoming().id is string;
+        }
+
+        function isMessageValid() {
+          return incoming().senderName is string && 
+                 incoming().senderName.size() <= 64 &&
+                 incoming().text is string && 
+                 incoming().text.size() <= 1000;
+        }
+
+        // Shared chat is readable by any player in the room
+        allow read, list: if isSignedIn() && exists(/databases/$(database)/documents/rooms/$(roomId));
+        
+        // Allowed to post chat messages if authenticated
+        allow create: if isSignedIn() && isMessageValid();
+        
+        // Messages cannot be updated or deleted to maintain logs
+        allow update, delete: if false;
+      }
+    }
+  }
+}

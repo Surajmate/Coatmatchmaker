@@ -23,7 +23,27 @@ import {
   Share2,
   Copy
 } from 'lucide-react';
-import { Card, Suit, GameState, Player, ChatMessage, ClientMessage, ServerMessage } from './types';
+import { Card, Suit, GameState, Player, ChatMessage } from './types';
+import { auth, db, googleProvider, handleFirestoreError, OperationType } from './utils/firebase';
+import { signInWithPopup, onAuthStateChanged, signOut, User as FirebaseUser } from 'firebase/auth';
+import { doc, setDoc, updateDoc, onSnapshot, collection, addDoc, query, orderBy, limit, getDoc, runTransaction } from 'firebase/firestore';
+import {
+  createDeck,
+  shuffle,
+  sortHand,
+  dealCards,
+  advanceDealer,
+  isPlayerPacked,
+  getNextTurn,
+  startNewRound,
+  handleBidSubmit,
+  handleHukoomSelect,
+  isCardPlayable as isCardPlayableInLogic,
+  getBotBid,
+  getBotHukoom,
+  getBotCardPlay,
+  resolveRoundScores
+} from './utils/gameLogic';
 
 // Let's generate a cool default name
 const ADJECTIVES = ['iOS', 'Apple', 'Spade', 'Siri', 'Swift', 'Apex', 'Pro', 'Neptune', 'Cosmic'];
@@ -45,7 +65,15 @@ export default function App() {
   
   // Game state
   const [gameState, setGameState] = useState<GameState | null>(null);
-  const [playerId, setPlayerId] = useState<string>('');
+  const [playerId] = useState<string>(() => {
+    let savedId = localStorage.getItem('spades_player_id');
+    if (!savedId) {
+      savedId = `usr_${Math.random().toString(36).substring(2, 10)}`;
+      localStorage.setItem('spades_player_id', savedId);
+    }
+    return savedId;
+  });
+  
   const [chatLog, setChatLog] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [connected, setConnected] = useState(false);
@@ -60,107 +88,88 @@ export default function App() {
   const [copiedCode, setCopiedCode] = useState(false);
   const cardsContainerRef = useRef<HTMLElement | null>(null);
 
+  // Connection control flags
+  const [isLocalOnly, setIsLocalOnly] = useState(false);
+  const [isHost, setIsHost] = useState(false);
+
+  // Firebase Auth states
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
   // Floating emoji reactions maps (seat index => emoji character)
   const [floatingEmojis, setFloatingEmojis] = useState<Record<number, { char: string; id: number }>>({});
   const emojiIdCounter = useRef(0);
 
-  const wsRef = useRef<WebSocket | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Monitor Auth state changes
+  useEffect(() => {
+    return onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      setAuthLoading(false);
+      if (user) {
+        if (user.displayName) {
+          setPlayerName(user.displayName);
+        }
+      }
+    });
+  }, []);
 
   // Sync player name changes to localStorage
   useEffect(() => {
     localStorage.setItem('spades_player_name', playerName);
   }, [playerName]);
 
-  // Connect websocket when entering a room or on initial mount for lobby state
-  const connectToWebsocket = (targetRoomId?: string) => {
-    if (wsRef.current) {
-      wsRef.current.close();
-    }
-
-    setErrorMessage(null);
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
-    
-    const socket = new WebSocket(wsUrl);
-    wsRef.current = socket;
-
-    socket.onopen = () => {
-      setConnected(true);
-      // Join room once connected
-      const joinMsg: ClientMessage = {
-        type: 'JOIN_ROOM',
-        roomId: targetRoomId || undefined,
-        name: playerName
-      };
-      socket.send(JSON.stringify(joinMsg));
-    };
-
-    socket.onmessage = (event) => {
-      try {
-        const serverMsg: ServerMessage = JSON.parse(event.data);
-        
-        if (serverMsg.type === 'ROOM_STATE' && serverMsg.state) {
-          setGameState(serverMsg.state);
-          setRoomId(serverMsg.state.roomId);
-          setJoined(true);
-          if (serverMsg.yourPlayerId) {
-            setPlayerId(serverMsg.yourPlayerId);
-          }
-          // Push to Address Bar for convenient sharing and refreshing
-          const newUrl = `${window.location.protocol}//${window.location.host}${window.location.pathname}?room=${serverMsg.state.roomId}`;
-          if (window.location.search !== `?room=${serverMsg.state.roomId}`) {
-            window.history.pushState({ path: newUrl }, '', newUrl);
-          }
-        } else if (serverMsg.type === 'CHAT_MESSAGE' && serverMsg.chat) {
-          const chat = serverMsg.chat;
-          // Check if it represents a floating emoji
-          if (chat.text.startsWith('[EMOJI]:') && chat.seat !== -1) {
-            const char = chat.text.replace('[EMOJI]:', '').trim();
-            emojiIdCounter.current += 1;
-            setFloatingEmojis(prev => ({
-              ...prev,
-              [chat.seat]: { char, id: emojiIdCounter.current }
-            }));
-            
-            // Play reaction beep
-            playTone(400, 0.1, 'sine');
-          } else {
-            setChatLog(prev => [...prev, chat].slice(-40));
-            // Standard notification beep for dealer
-            if (chat.senderName === 'Dealer') {
-              playTone(280, 0.15, 'triangle');
-            }
-          }
-        } else if (serverMsg.type === 'REJECT') {
-          setErrorMessage(serverMsg.error || 'Connection rejected by host.');
-          setJoined(false);
-        }
-      } catch (err) {
-        console.error('Error handling server payload:', err);
-      }
-    };
-
-    socket.onerror = (e) => {
-      console.error('WS Error:', e);
-      setErrorMessage('Server connection error. Please try again.');
-    };
-
-    socket.onclose = () => {
-      setConnected(false);
-    };
-  };
-
-  // Check URL parameters for direct room joining
+  // Real-time Firestore document and chat stream subscription listener
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const roomParam = params.get('room') || params.get('code');
-    if (roomParam) {
-      const cleanParam = roomParam.trim().toUpperCase();
-      setRoomIdInput(cleanParam);
-      connectToWebsocket(cleanParam);
-    }
-  }, []);
+    if (isLocalOnly || !roomId) return;
+
+    // Listen to Room Match Updates
+    const roomRef = doc(db, 'rooms', roomId);
+    const unsubRoom = onSnapshot(roomRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const nextState = snapshot.data() as GameState;
+        setGameState(nextState);
+      }
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `rooms/${roomId}`);
+    });
+
+    // Listen to Chat messages / Floating emoji log
+    const msgsRef = collection(db, 'rooms', roomId, 'messages');
+    const msgsQuery = query(msgsRef, orderBy('timestamp', 'asc'));
+    const unsubMsgs = onSnapshot(msgsQuery, (snapshot) => {
+      const msgsList: ChatMessage[] = [];
+      snapshot.forEach((docSnap) => {
+        const dat = docSnap.data();
+        if (dat.text && dat.text.startsWith('[EMOJI]:')) {
+          const char = dat.text.split('[EMOJI]:')[1].trim();
+          emojiIdCounter.current += 1;
+          setFloatingEmojis((prev) => ({
+            ...prev,
+            [dat.seat]: { char, id: emojiIdCounter.current }
+          }));
+          playTone(400, 0.1, 'sine');
+        } else {
+          msgsList.push({
+            id: docSnap.id,
+            senderName: dat.senderName,
+            text: dat.text,
+            seat: dat.seat,
+            timestamp: dat.timestamp
+          });
+        }
+      });
+      setChatLog(msgsList.slice(-40));
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `rooms/${roomId}/messages`);
+    });
+
+    return () => {
+      unsubRoom();
+      unsubMsgs();
+    };
+  }, [roomId, isLocalOnly]);
 
   // Sound generator using Web Audio API for immersive mechanical sounds
   const playTone = (frequency: number, duration: number, type: 'sine' | 'square' | 'sawtooth' | 'triangle' = 'sine') => {
@@ -186,107 +195,683 @@ export default function App() {
     }
   };
 
+  // Consolidated player and Bot action transaction runner supporting both local and Firestore matches
+  const applyInGameAction = async (actionFn: (state: GameState, addSystemLog: (txt: string) => void, onDealCards: () => void) => void) => {
+    if (isLocalOnly) {
+      setGameState((currentRoom) => {
+        if (!currentRoom) return currentRoom;
+        const updated = { ...currentRoom };
+        let logsAdded: string[] = [];
+        const addSystemLog = (txt: string) => logsAdded.push(txt);
+        actionFn(updated, addSystemLog, () => dealCards(updated));
+        
+        if (logsAdded.length > 0) {
+          setChatLog((prev) => {
+            const nextLog = [...prev];
+            logsAdded.forEach((l) => {
+              nextLog.push({
+                id: `sys_${Math.random()}`,
+                senderName: 'Dealer',
+                text: l,
+                seat: -1,
+                timestamp: Date.now()
+              });
+            });
+            return nextLog.slice(-40);
+          });
+        }
+        return updated;
+      });
+    } else {
+      if (!roomId) return;
+      try {
+        const roomRef = doc(db, 'rooms', roomId);
+        await runTransaction(db, async (transaction) => {
+          const snap = await transaction.get(roomRef);
+          if (!snap.exists()) return;
+          const currentRoom = snap.data() as GameState;
+          
+          let logsAdded: string[] = [];
+          const addSystemLog = (txt: string) => logsAdded.push(txt);
+          
+          actionFn(currentRoom, addSystemLog, () => dealCards(currentRoom));
+          
+          // Apply changes
+          transaction.set(roomRef, currentRoom);
+          
+          // Sync system chats
+          for (const logTxt of logsAdded) {
+            const msgRef = doc(collection(db, 'rooms', roomId, 'messages'));
+            transaction.set(msgRef, {
+              senderName: 'Dealer',
+              text: logTxt,
+              seat: -1,
+              timestamp: Date.now()
+            });
+          }
+        });
+      } catch (e) {
+        handleFirestoreError(e, OperationType.WRITE, `rooms/${roomId}`);
+      }
+    }
+  };
+
+  // Core execution of playing a card
+  const handlePlayCardDirectly = (room: GameState, seat: number, card: Card, addSystemLog: (t: string) => void) => {
+    const handIndex = room.hands[seat].findIndex(
+      (c) => c.suit === card.suit && c.value === card.value
+    );
+    if (handIndex === -1) return;
+
+    room.hands[seat].splice(handIndex, 1);
+    room.tricks.push({ card, playerIndex: seat });
+
+    const trump = room.highestBid === 'COAT' ? null : (room.hukoomSuit || 'S');
+    if (trump && card.suit === trump && room.leadingSuit !== trump) {
+      room.hukoomBroken = true;
+      room.spadesBroken = true;
+    }
+
+    if (room.tricks.length === 1) {
+      room.leadingSuit = card.suit;
+    }
+
+    // Set turn to next active person
+    room.currentTurn = getNextTurn(room, room.currentTurn);
+
+    const targetTrickSize = room.highestBid === 'COAT' ? 3 : 4;
+    if (room.tricks.length === targetTrickSize) {
+      const activeTrick = [...room.tricks];
+      const leadingSuit = room.leadingSuit!;
+      room.currentTurn = -1; // Block plays while trick completes displaying
+
+      // Slide delay for iOS visual comfort
+      setTimeout(async () => {
+        if (isLocalOnly) {
+          setGameState((currentRoom) => {
+            if (!currentRoom) return currentRoom;
+            const updated = { ...currentRoom };
+            let logsAdded: string[] = [];
+            const addSystemLogLocal = (txt: string) => logsAdded.push(txt);
+
+            const isCoatMode = updated.highestBid === 'COAT';
+
+            // Resolve Trick
+            const winnerSeat = activeTrick.reduce((best, item) => {
+              if (trump && item.card.suit === trump) {
+                if (best.card.suit !== trump || item.card.rank > best.card.rank) return item;
+              } else if (item.card.suit === leadingSuit && (!trump || best.card.suit !== trump)) {
+                if (best.card.suit !== leadingSuit || item.card.rank > best.card.rank) return item;
+              }
+              return best;
+            }, activeTrick[0]).playerIndex;
+
+            updated.tricks = [];
+            updated.leadingSuit = null;
+            updated.lastTrickWinner = winnerSeat;
+
+            // Score trick won
+            const wonTeam = (winnerSeat === 0 || winnerSeat === 2) ? 1 : 2;
+            if (wonTeam === 1) {
+              updated.team1TricksWon += 1;
+            } else {
+              updated.team2TricksWon += 1;
+            }
+
+            const wrName = updated.players[winnerSeat]?.name || `Seat ${winnerSeat + 1}`;
+            addSystemLogLocal(`${wrName} wins the trick!`);
+
+            playTone(480, 0.15, 'sine');
+
+            const bidderSeat = updated.highestBidder!;
+            const bidderTeam = (bidderSeat === 0 || bidderSeat === 2) ? 1 : 2;
+
+            if (isCoatMode && wonTeam !== bidderTeam) {
+              resolveRoundScores(updated, true, addSystemLogLocal);
+            } else {
+              const cardsRemaining = updated.hands[0].length;
+              if (cardsRemaining === 0) {
+                resolveRoundScores(updated, false, addSystemLogLocal);
+              } else {
+                if (updated.phase === 'PLAYING') {
+                  updated.currentTurn = winnerSeat;
+                }
+              }
+            }
+
+            if (logsAdded.length > 0) {
+              setChatLog((prev) => [
+                ...prev,
+                ...logsAdded.map(l => ({
+                  id: `sys_${Math.random()}`,
+                  senderName: 'Dealer',
+                  text: l,
+                  seat: -1,
+                  timestamp: Date.now()
+                }))
+              ].slice(-40));
+            }
+
+            return updated;
+          });
+        } else {
+          // Online mode! Resolve in a single transaction
+          if (!roomId) return;
+          try {
+            const roomRef = doc(db, 'rooms', roomId);
+            await runTransaction(db, async (transaction) => {
+              const snap = await transaction.get(roomRef);
+              if (!snap.exists()) return;
+              const updated = snap.data() as GameState;
+
+              if (updated.tricks.length === targetTrickSize) {
+                let logsAdded: string[] = [];
+                const addSystemLogLocal = (txt: string) => logsAdded.push(txt);
+                const isCoatMode = updated.highestBid === 'COAT';
+
+                // Resolve Trick
+                const winnerSeat = activeTrick.reduce((best, item) => {
+                  if (trump && item.card.suit === trump) {
+                    if (best.card.suit !== trump || item.card.rank > best.card.rank) return item;
+                  } else if (item.card.suit === leadingSuit && (!trump || best.card.suit !== trump)) {
+                    if (best.card.suit !== leadingSuit || item.card.rank > best.card.rank) return item;
+                  }
+                  return best;
+                }, activeTrick[0]).playerIndex;
+
+                updated.tricks = [];
+                updated.leadingSuit = null;
+                updated.lastTrickWinner = winnerSeat;
+
+                const wonTeam = (winnerSeat === 0 || winnerSeat === 2) ? 1 : 2;
+                if (wonTeam === 1) {
+                  updated.team1TricksWon += 1;
+                } else {
+                  updated.team2TricksWon += 1;
+                }
+
+                const wrName = updated.players[winnerSeat]?.name || `Seat ${winnerSeat + 1}`;
+                addSystemLogLocal(`${wrName} wins the trick!`);
+
+                const bidderSeat = updated.highestBidder!;
+                const bidderTeam = (bidderSeat === 0 || bidderSeat === 2) ? 1 : 2;
+
+                if (isCoatMode && wonTeam !== bidderTeam) {
+                  resolveRoundScores(updated, true, addSystemLogLocal);
+                } else {
+                  const cardsRemaining = updated.hands[0].length;
+                  if (cardsRemaining === 0) {
+                    resolveRoundScores(updated, false, addSystemLogLocal);
+                  } else {
+                    if (updated.phase === 'PLAYING') {
+                      updated.currentTurn = winnerSeat;
+                    }
+                  }
+                }
+
+                transaction.set(roomRef, updated);
+
+                for (const logTxt of logsAdded) {
+                  const mRef = doc(collection(db, 'rooms', roomId, 'messages'));
+                  transaction.set(mRef, {
+                    senderName: 'Dealer',
+                    text: logTxt,
+                    seat: -1,
+                    timestamp: Date.now()
+                  });
+                }
+              }
+            });
+          } catch (e) {
+            handleFirestoreError(e, OperationType.WRITE, `rooms/${roomId}`);
+          }
+        }
+      }, 1600);
+    }
+  };
+
+  // Offline and Local Bot Practice initialization
+  const startLocalGame = () => {
+    setIsLocalOnly(true);
+    setIsHost(false);
+    setJoined(true);
+    setErrorMessage(null);
+
+    const rId = `BOT_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    setRoomId(rId);
+
+    const initRoom: GameState = {
+      roomId: rId,
+      phase: 'LOBBY',
+      players: [
+        { id: playerId, name: playerName, isBot: false, seat: 0, isReady: false },
+        { id: 'bot_1', name: 'Robot_Swift', isBot: true, seat: 1, isReady: true },
+        { id: 'bot_2', name: 'Robot_Apex', isBot: true, seat: 2, isReady: true },
+        { id: 'bot_3', name: 'Robot_Cosmic', isBot: true, seat: 3, isReady: true }
+      ],
+      dealer: 0,
+      currentBidder: 0,
+      highestBid: null,
+      highestBidder: null,
+      bids: [null, null, null, null],
+      hands: [[], [], [], []],
+      currentTurn: 0,
+      tricks: [],
+      leadingSuit: null,
+      spadesBroken: false,
+      hukoomSuit: null,
+      hukoomBroken: false,
+      team1TricksWon: 0,
+      team2TricksWon: 0,
+      scoreTeam1: 0,
+      scoreTeam2: 0,
+      winnerTeam: null,
+      history: [],
+      lastTrickWinner: null
+    };
+
+    setGameState(initRoom);
+    setChatLog([
+      {
+        id: 'sys_local_init',
+        senderName: 'Dealer',
+        text: 'Lobby ready! Click "START GAME" at the bottom to deal cards to you and the Bots!',
+        seat: -1,
+        timestamp: Date.now()
+      }
+    ]);
+  };
+
+  // Online Multiplayer Host Game Room initialization
+  const startOnlineRoom = async () => {
+    let activeUser = auth.currentUser;
+    if (!activeUser) {
+      try {
+        const result = await signInWithPopup(auth, googleProvider);
+        activeUser = result.user;
+      } catch (err) {
+        setErrorMessage("Google Sign-In is required to host online multiplayer games.");
+        return;
+      }
+    }
+
+    setIsLocalOnly(false);
+    setIsHost(true);
+    setJoined(true);
+    setErrorMessage(null);
+
+    // Generate online code
+    const rId = Math.random().toString(36).substring(2, 8).toUpperCase();
+    setRoomId(rId);
+
+    const activePlayerId = activeUser?.uid || playerId;
+    const activePlayerName = activeUser?.displayName || playerName;
+
+    const initRoom: GameState = {
+      roomId: rId,
+      phase: 'LOBBY',
+      players: [
+        { id: activePlayerId, name: activePlayerName, isBot: false, seat: 0, isReady: false },
+        null, null, null
+      ],
+      dealer: 0,
+      currentBidder: 0,
+      highestBid: null,
+      highestBidder: null,
+      bids: [null, null, null, null],
+      hands: [[], [], [], []],
+      currentTurn: 0,
+      tricks: [],
+      leadingSuit: null,
+      spadesBroken: false,
+      hukoomSuit: null,
+      hukoomBroken: false,
+      team1TricksWon: 0,
+      team2TricksWon: 0,
+      scoreTeam1: 0,
+      scoreTeam2: 0,
+      winnerTeam: null,
+      history: [],
+      lastTrickWinner: null
+    };
+
+    try {
+      await setDoc(doc(db, 'rooms', rId), initRoom);
+      setConnected(true);
+
+      // System chat initial
+      await addDoc(collection(db, 'rooms', rId, 'messages'), {
+        senderName: 'Dealer',
+        text: `Online room hosted by ${activePlayerName}! Share room code: ${rId}`,
+        seat: -1,
+        timestamp: Date.now()
+      });
+
+      const newUrl = `${window.location.protocol}//${window.location.host}${window.location.pathname}?room=${rId}`;
+      window.history.pushState({ path: newUrl }, '', newUrl);
+    } catch (e) {
+      handleFirestoreError(e, OperationType.CREATE, `rooms/${rId}`);
+    }
+  };
+
+  // Join friend's hosted online table via room code
+  const joinOnlineRoom = async (targetRoomId: string) => {
+    let activeUser = auth.currentUser;
+    if (!activeUser) {
+      try {
+        const result = await signInWithPopup(auth, googleProvider);
+        activeUser = result.user;
+      } catch (err) {
+        setErrorMessage("Google Sign-In is required to join online multiplayer games.");
+        return;
+      }
+    }
+
+    setIsLocalOnly(false);
+    setIsHost(false);
+    setErrorMessage(null);
+
+    const activePlayerId = activeUser?.uid || playerId;
+    const activePlayerName = activeUser?.displayName || playerName;
+
+    try {
+      const roomRef = doc(db, 'rooms', targetRoomId);
+      const roomSnap = await getDoc(roomRef);
+      if (!roomSnap.exists()) {
+        setErrorMessage(`Room ${targetRoomId} not found.`);
+        return;
+      }
+
+      const activeRoom = roomSnap.data() as GameState;
+      
+      // Check if player is already seated
+      const existingSeat = activeRoom.players.findIndex(p => p && p.id === activePlayerId);
+
+      if (existingSeat === -1) {
+        // Find vacant seat
+        const vacantSeat = activeRoom.players.findIndex(p => p === null);
+        if (vacantSeat === -1) {
+          setErrorMessage("Table is already full (4 players).");
+          return;
+        }
+
+        // Register in slot
+        activeRoom.players[vacantSeat] = {
+          id: activePlayerId,
+          name: activePlayerName,
+          isBot: false,
+          seat: vacantSeat,
+          isReady: false
+        };
+
+        await updateDoc(roomRef, {
+          players: activeRoom.players
+        });
+
+        // Add arrival system chat
+        await addDoc(collection(db, 'rooms', targetRoomId, 'messages'), {
+          senderName: 'Dealer',
+          text: `${activePlayerName} joined at Seat ${vacantSeat + 1}!`,
+          seat: -1,
+          timestamp: Date.now()
+        });
+      }
+
+      setJoined(true);
+      setRoomId(targetRoomId);
+      setConnected(true);
+
+      const newUrl = `${window.location.protocol}//${window.location.host}${window.location.pathname}?room=${targetRoomId}`;
+      window.history.pushState({ path: newUrl }, '', newUrl);
+
+    } catch (e) {
+      handleFirestoreError(e, OperationType.GET, `rooms/${targetRoomId}`);
+    }
+  };
+
+  // Handle URL parameter deep linking directly to hosted tables
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const roomParam = params.get('room') || params.get('code');
+    if (roomParam) {
+      const cleanParam = roomParam.trim().toUpperCase();
+      setRoomIdInput(cleanParam);
+      joinOnlineRoom(cleanParam);
+    }
+  }, []);
+
   // Auto scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatLog]);
 
-  // Handle playing card
+  // Handle local and BOT scheduling executions
+  useEffect(() => {
+    if (!gameState) return;
+    const isControlMaster = isLocalOnly || isHost;
+    if (!isControlMaster) return;
+
+    if (gameState.phase === 'BIDDING') {
+      const currentBidder = gameState.currentBidder;
+      const playerObj = gameState.players[currentBidder];
+      if (playerObj && playerObj.isBot) {
+        const tickVal = setTimeout(() => {
+          const targetBid = getBotBid(gameState, currentBidder);
+          applyInGameAction((updated, addSystemLog, onDealCards) => {
+            handleBidSubmit(updated, currentBidder, targetBid, addSystemLog, onDealCards);
+          });
+        }, 1100);
+        return () => clearTimeout(tickVal);
+      }
+    } else if (gameState.phase === 'SELECTING_HUKOOM') {
+      const currentTurn = gameState.currentTurn;
+      const playerObj = gameState.players[currentTurn];
+      if (playerObj && playerObj.isBot) {
+        const tickVal = setTimeout(() => {
+          const trumpSuit = getBotHukoom(gameState, currentTurn);
+          applyInGameAction((updated, addSystemLog) => {
+            handleHukoomSelect(updated, currentTurn, trumpSuit, addSystemLog);
+          });
+        }, 1100);
+        return () => clearTimeout(tickVal);
+      }
+    } else if (gameState.phase === 'PLAYING') {
+      const currentTurn = gameState.currentTurn;
+      if (currentTurn === -1) return;
+      const playerObj = gameState.players[currentTurn];
+      if (playerObj && playerObj.isBot) {
+        const tickVal = setTimeout(() => {
+          const playedCard = getBotCardPlay(gameState, currentTurn);
+          applyInGameAction((updated, addSystemLog) => {
+            playTone(330, 0.1, 'triangle');
+            handlePlayCardDirectly(updated, currentTurn, playedCard, addSystemLog);
+          });
+        }, 1100);
+        return () => clearTimeout(tickVal);
+      }
+    }
+  }, [
+    gameState?.phase,
+    gameState?.currentTurn,
+    gameState?.currentBidder,
+    isHost,
+    isLocalOnly
+  ]);
+
+  // Handle active card played by User
   const playCard = (card: Card) => {
-    if (!wsRef.current || !gameState) return;
-    
-    // Play local audio cue
     playTone(330, 0.1, 'triangle');
-    
-    wsRef.current.send(JSON.stringify({
-      type: 'PLAY_CARD',
-      card
-    }));
+    applyInGameAction((updated, addSystemLog) => {
+      handlePlayCardDirectly(updated, mySeatIndex, card, addSystemLog);
+    });
   };
 
-  // Submit Bid
+  // Submit Bid action
   const submitBid = (bid: string) => {
-    if (!wsRef.current) return;
     playTone(440, 0.15, 'sine');
-    wsRef.current.send(JSON.stringify({
-      type: 'SUBMIT_BID',
-      bid
-    }));
+    applyInGameAction((updated, addSystemLog, onDealCards) => {
+      handleBidSubmit(updated, mySeatIndex, bid, addSystemLog, onDealCards);
+    });
   };
 
-  // Select Hukoom (Trump Suit)
+  // Choose Trump Hukoom Suit action
   const selectHukoom = (suit: Suit) => {
-    if (!wsRef.current) return;
     playTone(660, 0.1, 'sine');
-    wsRef.current.send(JSON.stringify({
-      type: 'SELECT_HUKOOM',
-      hukoomSuit: suit
-    }));
+    applyInGameAction((updated, addSystemLog) => {
+      handleHukoomSelect(updated, mySeatIndex, suit, addSystemLog);
+    });
   };
 
-  // Ready toggling
+  // Ready state toggle action
   const toggleReady = () => {
-    if (!wsRef.current) return;
     playTone(520, 0.1, 'sine');
-    wsRef.current.send(JSON.stringify({ type: 'TOGGLE_READY' }));
+    applyInGameAction((updated) => {
+      if (updated.players[mySeatIndex]) {
+        updated.players[mySeatIndex]!.isReady = !updated.players[mySeatIndex]!.isReady;
+      }
+    });
   };
 
-  // Add Bots to populate
+  // Populate empty table seats with bots action
   const forceBots = () => {
-    if (!wsRef.current) return;
     playTone(440, 0.12, 'square');
-    wsRef.current.send(JSON.stringify({ type: 'FORCE_BOTS' }));
+    applyInGameAction((updated, addSystemLog) => {
+      for (let i = 0; i < 4; i++) {
+        if (updated.players[i] === null) {
+          updated.players[i] = {
+            id: `bot_${i}`,
+            name: `Robot_${i === 1 ? 'Swift' : i === 2 ? 'Apex' : 'Cosmic'}`,
+            isBot: true,
+            seat: i,
+            isReady: true
+          };
+          addSystemLog(`Seat ${i + 1} filled by Bot!`);
+        }
+      }
+      const allOccupied = updated.players.every((p) => p !== null);
+      if (allOccupied) {
+        startNewRound(updated, addSystemLog);
+      }
+    });
   };
 
-  // Start game
+  // Start deal game action
   const startGame = () => {
-    if (!wsRef.current) return;
     playTone(600, 0.25, 'sine');
-    wsRef.current.send(JSON.stringify({ type: 'START_GAME' }));
+    applyInGameAction((updated, addSystemLog) => {
+      startNewRound(updated, addSystemLog);
+    });
   };
 
-  // Send a custom chat message
-  const sendChatMessage = (e?: React.FormEvent) => {
+  // Send a custom chat message action
+  const sendChatMessage = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!chatInput.trim() || !wsRef.current) return;
-    
-    wsRef.current.send(JSON.stringify({
-      type: 'SEND_CHAT',
-      chatText: chatInput
-    }));
+    if (!chatInput.trim()) return;
+
+    const sender = currentUser?.displayName || playerName;
+
+    if (isLocalOnly) {
+      setChatLog((prev) => [
+        ...prev,
+        {
+          id: `chat_${Math.random()}`,
+          senderName: sender,
+          text: chatInput,
+          seat: mySeatIndex,
+          timestamp: Date.now()
+        }
+      ].slice(-40));
+    } else {
+      if (!roomId) return;
+      try {
+        await addDoc(collection(db, 'rooms', roomId, 'messages'), {
+          senderName: sender,
+          text: chatInput,
+          seat: mySeatIndex,
+          timestamp: Date.now()
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, `rooms/${roomId}/messages`);
+      }
+    }
     setChatInput('');
   };
 
-  // Trigger floating emoji reaction
-  const triggerEmojiReaction = (emoji: string) => {
-    if (!wsRef.current) return;
-    wsRef.current.send(JSON.stringify({
-      type: 'SEND_CHAT',
-      chatText: `[EMOJI]:${emoji}`
-    }));
-  };
-
-  // Restart Round or Game
-  const triggerRestart = () => {
-    if (!wsRef.current) return;
-    playTone(450, 0.2, 'sawtooth');
-    wsRef.current.send(JSON.stringify({ type: 'RESTART_GAME' }));
-  };
-
-  // Leave Room
-  const leaveRoom = () => {
-    if (wsRef.current) {
-      wsRef.current.close();
+  // Send reaction emoji action
+  const triggerEmojiReaction = async (emoji: string) => {
+    const sender = currentUser?.displayName || playerName;
+    if (isLocalOnly) {
+      emojiIdCounter.current += 1;
+      setFloatingEmojis((prev) => ({
+        ...prev,
+        [mySeatIndex]: { char: emoji, id: emojiIdCounter.current }
+      }));
+      playTone(400, 0.1, 'sine');
+    } else {
+      if (!roomId) return;
+      try {
+        await addDoc(collection(db, 'rooms', roomId, 'messages'), {
+          senderName: sender,
+          text: `[EMOJI]:${emoji}`,
+          seat: mySeatIndex,
+          timestamp: Date.now()
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, `rooms/${roomId}/messages`);
+      }
     }
+  };
+
+  // Restart Round or entire Game action
+  const triggerRestart = () => {
+    playTone(450, 0.2, 'sawtooth');
+    applyInGameAction((updated, addSystemLog) => {
+      updated.scoreTeam1 = 0;
+      updated.scoreTeam2 = 0;
+      updated.winnerTeam = null;
+      updated.history = [];
+      startNewRound(updated, addSystemLog);
+    });
+  };
+
+  // Exit Room action
+  const leaveRoom = async () => {
+    if (!isLocalOnly && roomId) {
+      try {
+        const roomRef = doc(db, 'rooms', roomId);
+        const roomSnap = await getDoc(roomRef);
+        if (roomSnap.exists()) {
+          const room = roomSnap.data() as GameState;
+          const activeUserId = currentUser?.uid || playerId;
+          const sIndex = room.players.findIndex(p => p && p.id === activeUserId);
+          if (sIndex !== -1) {
+            const leavingName = room.players[sIndex]?.name || 'Player';
+            room.players[sIndex] = null;
+            await updateDoc(roomRef, {
+              players: room.players
+            });
+            await addDoc(collection(db, 'rooms', roomId, 'messages'), {
+              senderName: 'Dealer',
+              text: `${leavingName} left Seat ${sIndex + 1}.`,
+              seat: -1,
+              timestamp: Date.now()
+            });
+          }
+        }
+      } catch (e) {
+        // Ignored
+      }
+    }
+
     setJoined(false);
     setGameState(null);
     setRoomId(null);
     setChatLog([]);
-    // Remove query parameter
     const cleanUrl = `${window.location.protocol}//${window.location.host}${window.location.pathname}`;
     window.history.pushState({ path: cleanUrl }, '', cleanUrl);
   };
 
+  // Clipboard copies
   const copyInviteLink = () => {
     if (!roomId) return;
     const inviteUrl = `${window.location.origin}${window.location.pathname}?room=${roomId}`;
@@ -306,26 +891,14 @@ export default function App() {
     });
   };
 
-  // Keep connection alive with a simple ping every 15 seconds
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'PING' }));
-      }
-    }, 15000);
-    return () => clearInterval(interval);
-  }, []);
-
   // Determine user seat index
-  // Each client connection identifies itself by checking which seat has ID matching the assigned playerId
   let mySeatIndex = 0;
   if (gameState) {
-    let seatFoundIndex = gameState.players.findIndex(p => p && p.id === playerId);
+    let seatFoundIndex = gameState.players.findIndex((p) => p && p.id === playerId);
     if (seatFoundIndex !== -1) {
       mySeatIndex = seatFoundIndex;
     } else {
-      // fallback to name matching if playerId isn't fully synced yet
-      seatFoundIndex = gameState.players.findIndex(p => p && !p.isBot && p.name === playerName);
+      seatFoundIndex = gameState.players.findIndex((p) => p && !p.isBot && p.name === playerName);
       if (seatFoundIndex !== -1) {
         mySeatIndex = seatFoundIndex;
       }
@@ -360,14 +933,8 @@ export default function App() {
     return s === 'S' ? 'bg-[#1e1b4b]/10 hover:bg-[#1e1b4b]/20' : '';
   };
 
-  // Find partner seat (userSeat + 2 % 4)
   const myPartnerSeat = (mySeatIndex + 2) % 4;
 
-  // Render player rotation configuration
-  // The bottom seat index is ALWAYS user seat index.
-  // Left is (mySeatIndex + 1) % 4.
-  // Top is (mySeatIndex + 2) % 4 (Our teammate!).
-  // Right is (mySeatIndex + 3) % 4.
   const seatsOrder = [
     { label: 'Bottom (You)', index: mySeatIndex },
     { label: 'Left', index: (mySeatIndex + 1) % 4 },
@@ -376,8 +943,6 @@ export default function App() {
   ];
 
   const getRelativePositionClass = (relIndex: number) => {
-    // Return CSS placement class relative to standard layout wrapper
-    // relIndex is absolute seat index (0-3) mapped to layout (0=bottom, 1=left, 2=top, 3=right)
     const orderInLayout = (relIndex - mySeatIndex + 4) % 4;
     switch (orderInLayout) {
       case 0: return 'absolute bottom-1 md:bottom-[-10px] left-1/2 -translate-x-1/2 z-30';
@@ -390,58 +955,29 @@ export default function App() {
   const getTrickCardPositionClass = (absolutePlayerSeat: number) => {
     const orderInLayout = (absolutePlayerSeat - mySeatIndex + 4) % 4;
     switch (orderInLayout) {
-      case 0: // Bottom player's card
+      case 0:
         return 'bottom-2 md:bottom-4 left-1/2 -translate-x-1/2 rotate-[-2deg] z-20 shadow-xl border-emerald-500 border-2 scale-105';
-      case 1: // Left player's card
+      case 1:
         return 'left-2 md:left-4 top-1/2 -translate-y-1/2 rotate-[-15deg] z-10 shadow-lg';
-      case 2: // Top partner's card
+      case 2:
         return 'top-2 md:top-4 left-1/2 -translate-x-1/2 rotate-[5deg] z-10 shadow-lg';
-      case 3: // Right player's card
+      case 3:
         return 'right-2 md:right-4 top-1/2 -translate-y-1/2 rotate-[12deg] z-10 shadow-lg';
     }
   };
 
-  // Filter playable cards logic for user hand selection
+  // Check if hand card is playable locally
   const isCardPlayable = (card: Card) => {
-    if (!gameState || gameState.phase !== 'PLAYING' || gameState.currentTurn !== mySeatIndex) {
-      return false;
-    }
-    const myHand = gameState.hands[mySeatIndex] || [];
-    
-    // If we're following a trick
-    if (gameState.tricks.length > 0) {
-      const leadingSuit = gameState.leadingSuit!;
-      const hasLeading = myHand.some(c => c.suit === leadingSuit);
-      if (hasLeading) {
-        return card.suit === leadingSuit;
-      }
-      return true; // Can play anything (including trump) if we lack leading suit
-    } else {
-      // We are leading the trick
-      const trump = gameState.highestBid === 'COAT' ? null : (gameState.hukoomSuit || 'S');
-      if (trump) {
-        const trumpBroken = gameState.hukoomBroken !== undefined ? gameState.hukoomBroken : gameState.spadesBroken;
-        if (card.suit === trump && !trumpBroken) {
-          // Can only lead trump if we have nothing else in hand
-          const hasOther = myHand.some(c => c.suit !== trump);
-          return !hasOther;
-        }
-      }
-      return true;
-    }
+    if (!gameState) return false;
+    return isCardPlayableInLogic(gameState, mySeatIndex, card);
   };
 
-  // Start Quick/Random Matchmaking
-  const handleQuickMatch = () => {
-    connectToWebsocket();
-  };
-
-  // Join Room by Code
+  // Join Room from Code submit
   const handleJoinByCode = (e: React.FormEvent) => {
     e.preventDefault();
     const cleanId = roomIdInput.trim().toUpperCase();
     if (cleanId) {
-      connectToWebsocket(cleanId);
+      joinOnlineRoom(cleanId);
     }
   };
 
@@ -494,6 +1030,63 @@ export default function App() {
                 Multiplayer Active
               </div>
 
+              {/* Google Authentication Account Profile */}
+              {authLoading ? (
+                <div className="flex items-center justify-center py-4 text-white/40 gap-2 text-xs font-bold uppercase tracking-wider">
+                  <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+                  Securing Connection...
+                </div>
+              ) : currentUser ? (
+                <div className="bg-white/5 border border-white/10 rounded-2xl p-4 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    {currentUser.photoURL ? (
+                      <img
+                        src={currentUser.photoURL}
+                        alt="Google Avatar"
+                        className="w-10 h-10 rounded-full border border-emerald-500/30"
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : (
+                      <div className="w-10 h-10 rounded-full bg-emerald-500/10 flex items-center justify-center text-sm font-bold text-emerald-400 border border-emerald-500/20">
+                        {currentUser.displayName?.substring(0, 2).toUpperCase() || 'GP'}
+                      </div>
+                    )}
+                    <div>
+                      <div className="text-[9px] text-emerald-400 font-extrabold uppercase tracking-widest">Google Account</div>
+                      <div className="text-sm font-semibold text-white tracking-tight leading-snug">
+                        {currentUser.displayName || 'Google spade Player'}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => { signOut(auth); playTone(300, 0.15, 'sawtooth'); }}
+                    className="px-3 py-1.5 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 rounded-xl text-[10px] text-red-400 font-bold uppercase tracking-wider transition-all"
+                  >
+                    Sign Out
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Connect Account</label>
+                  <button
+                    onClick={async () => {
+                      try {
+                        playTone(520, 0.15, 'sine');
+                        await signInWithPopup(auth, googleProvider);
+                      } catch (err: any) {
+                        setErrorMessage(err.message || 'Google authentication failed.');
+                      }
+                    }}
+                    className="w-full bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl p-4 flex items-center justify-center gap-2.5 transition-all text-xs font-bold uppercase tracking-wider text-white shadow-md active:scale-[0.98]"
+                  >
+                    <svg className="w-4 h-4 text-emerald-400" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12.24 10.285V13.4h6.887C18.2 15.614 15.645 18 12.24 18c-4.135 0-7.5-3.365-7.5-7.5s3.365-7.5 7.5-7.5c1.865 0 3.555.68 4.88 1.8l2.36-2.36C17.47.79 14.995 0 12.24 0 5.48 0 0 5.48 0 12.24s5.48 12.24 12.24 12.24c6.315 0 11.36-4.505 11.36-11.36 0-.765-.075-1.5-.215-2.2H12.24z"/>
+                    </svg>
+                    Sign In with Google
+                  </button>
+                </div>
+              )}
+
               {/* Player profile edit */}
               <div className="space-y-2">
                 <label className="text-xs font-bold text-white/40 uppercase tracking-widest">Your Nickname</label>
@@ -519,11 +1112,19 @@ export default function App() {
               {/* Matchmaking trigger */}
               <div className="space-y-3 pt-2">
                 <button
-                  onClick={() => { handleQuickMatch(); playTone(540, 0.15, 'sine'); }}
-                  className="w-full py-4 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-black text-sm uppercase tracking-wider rounded-2xl shadow-[0_10px_30px_rgba(16,185,129,0.3)] hover:shadow-[0_10px_35px_rgba(16,185,129,0.55)] transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+                  onClick={() => { startLocalGame(); playTone(540, 0.15, 'sine'); }}
+                  className="w-full py-4 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-slate-950 font-extrabold text-xs uppercase tracking-wider rounded-2xl shadow-[0_10px_30px_rgba(16,185,129,0.3)] hover:shadow-[0_10px_35px_rgba(16,185,129,0.55)] transition-all active:scale-[0.98] flex items-center justify-center gap-2"
                 >
-                  <Zap className="w-4 h-4 fill-slate-950" />
-                  Quick Match (Find Game)
+                  <Bot className="w-4 h-4" />
+                  Local Practice Match vs Bots (Instant Offline)
+                </button>
+
+                <button
+                  onClick={() => { startOnlineRoom(); playTone(540, 0.15, 'sine'); }}
+                  className="w-full py-3.5 bg-white/5 hover:bg-white/10 text-white border border-white/10 font-bold text-xs uppercase tracking-wider rounded-2xl transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+                >
+                  <Crown className="w-4 h-4 text-emerald-400 fill-emerald-400/10" />
+                  Host New Online Room
                 </button>
                 
                 <div className="flex items-center gap-3 my-4">
